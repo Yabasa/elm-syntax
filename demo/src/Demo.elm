@@ -114,9 +114,14 @@ update msg model =
             }
 
         CursorMoved newPos ->
+            let
+                -- NOTE: need to add one to the cusorPos as a text area starts at 0 but the AST starts at 1
+                newCursorPos =
+                    newPos + 1
+            in
             { model
-                | activeMapping = getActiveMapping model.srcToAstMap newPos
-                , cursorPos = newPos
+                | activeMapping = getActiveMapping model.srcToAstMap newCursorPos
+                , cursorPos = newCursorPos
             }
 
         ToggleAstStyle ->
@@ -153,57 +158,33 @@ update msg model =
 getActiveMapping : List SrcToAstMapping -> Int -> Maybe SrcToAstMapping
 getActiveMapping srcToAstMap cursorPos =
     let
-        matchingMappings : List SrcToAstMapping
-        matchingMappings =
+        matches : List SrcToAstMapping
+        matches =
             srcToAstMap
                 |> List.filter
-                    (\m -> cursorPos >= m.srcStringOffsetStart && cursorPos < m.srcStringOffsetEnd)
+                    (\m -> cursorPos >= m.srcStringOffsetStart && cursorPos <= m.srcStringOffsetEnd)
 
-        compareRanges : SrcToAstMapping -> SrcToAstMapping -> Order
-        compareRanges a b =
-            let
-                aRange =
-                    a.srcStringOffsetEnd - a.srcStringOffsetStart
-
-                bRange =
-                    b.srcStringOffsetEnd - b.srcStringOffsetStart
-
-                diff =
-                    aRange - bRange
-            in
-            if diff < 0 then
-                LT
-
-            else if diff == 0 then
-                EQ
-
-            else
-                GT
-
-        bestMatch : Maybe SrcToAstMapping
-        bestMatch =
-            matchingMappings
-                |> List.sortWith compareRanges
+        smallestRangeMatch : Maybe SrcToAstMapping
+        smallestRangeMatch =
+            matches
                 |> List.head
 
-        nearestMatch : Maybe SrcToAstMapping
-        nearestMatch =
-            srcToAstMap
-                |> List.filter (\m -> m.srcStringOffsetStart - cursorPos == 1)
-                |> List.sortWith compareRanges
+        largestRangeMatch : Maybe SrcToAstMapping
+        largestRangeMatch =
+            matches
                 |> List.reverse
                 |> List.head
     in
-    if cursorPos == 0 then
-        Nothing
+    case ( smallestRangeMatch, largestRangeMatch ) of
+        ( Just srm, Just lrm ) ->
+            if srm.srcStringOffsetStart == lrm.srcStringOffsetStart && srm.srcStringOffsetStart == cursorPos then
+                largestRangeMatch
 
-    else
-        case bestMatch of
-            Nothing ->
-                nearestMatch
+            else
+                smallestRangeMatch
 
-            Just m ->
-                Just m
+        _ ->
+            smallestRangeMatch
 
 
 getStyledAst : String -> AstStyle -> String

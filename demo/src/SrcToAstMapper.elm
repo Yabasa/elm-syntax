@@ -14,6 +14,7 @@ mapSrcToAst srcString astString =
     run pNodeTrees astString
         |> Result.map (List.map (createMapping srcString))
         |> Result.withDefault []
+        |> List.sortWith order
 
 
 
@@ -238,3 +239,25 @@ locToOffset loc src =
         |> List.map (\s -> String.length s + 1)
         |> List.sum
         |> (+) loc.column
+
+
+order : SrcToAstMapping -> SrcToAstMapping -> Order
+order a b =
+    let
+        aRange =
+            a.srcStringOffsetEnd - a.srcStringOffsetStart
+
+        bRange =
+            b.srcStringOffsetEnd - b.srcStringOffsetStart
+
+        diff =
+            aRange - bRange
+    in
+    if diff < 0 then
+        LT
+
+    else if diff == 0 then
+        EQ
+
+    else
+        GT
