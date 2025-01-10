@@ -1,7 +1,11 @@
 module SrcToAstMapper exposing (SrcToAstMapping, mapSrcToAst)
 
-import Elm.Syntax.Range exposing (Location, Range)
-import Parser exposing (..)
+import Elm.Parser
+import Elm.Processing
+import Elm.Syntax.Declaration exposing (Declaration(..))
+import Elm.Syntax.Expression exposing (Expression(..))
+import Elm.Syntax.Node as Node exposing (Node(..))
+import Elm.Syntax.Range as Range exposing (Location, Range)
 
 
 {-| Given a piece of source code and it's parsed AST as a string, determine the
@@ -11,10 +15,59 @@ of the source code string.
 -}
 mapSrcToAst : String -> String -> List SrcToAstMapping
 mapSrcToAst srcString astString =
-    run pNodeTrees astString
-        |> Result.map (List.map (createMapping srcString))
+    let
+        parsableAstString =
+            "module DisplayAst exposing (ast)\nast = " ++ astString
+
+        astAst =
+            astOfAstString parsableAstString
+
+        rngs =
+            astAst
+                |> extractNodeRanges
+    in
+    List.map (createMapping srcString parsableAstString) rngs
+
+
+
+-- This is pulling out the Node that represents the Node in the source string with all the module stuff that was added to enable it to be parsed removed.
+
+
+astOfAstString : String -> Node Expression
+astOfAstString astStr =
+    let
+        parseResult =
+            astStr
+                |> Elm.Parser.parse
+                |> Result.map (Elm.Processing.process Elm.Processing.init)
+
+        dbg =
+            Debug.log "parseResult" parseResult
+    in
+    Result.map .declarations parseResult
         |> Result.withDefault []
-        |> List.sortWith order
+        |> List.head
+        |> Maybe.withDefault
+            (Node.empty
+                (CustomTypeDeclaration
+                    { documentation = Nothing
+                    , name = Node.empty ""
+                    , generics = []
+                    , constructors = []
+                    }
+                )
+            )
+        |> (\(Node _ d) -> d)
+        |> (\dec ->
+                case dec of
+                    FunctionDeclaration func ->
+                        case func.declaration of
+                            Node _ fi ->
+                                fi.expression
+
+                    _ ->
+                        Node.empty (Application [])
+           )
 
 
 
@@ -23,14 +76,12 @@ mapSrcToAst srcString astString =
 --
 
 
-{-| Intermediate type for holding raw parsed AST info.
-
-Payloads are essentially:
-AstStringOffsetStart SrcRange AstStringOffsetEnd
-
+{-| Intermediate type for holding raw source and AST ranges that map to each toher.
 -}
-type AstNodeInfo
-    = AstNodeInfo Int Range Int
+type alias SrcToAstMappingRanges =
+    { srcStrRange : Range
+    , astStrRange : Range
+    }
 
 
 {-| Final type for holding mapping with src range converted to offsets for more
@@ -46,162 +97,110 @@ type alias SrcToAstMapping =
 
 
 --
--- AST STRING PARSERS
+-- AST PROCESSING
 --
 
 
-pLoc : Parser Location
-pLoc =
-    succeed (\col row -> Location row col)
-        |. symbol "{"
-        |. spaces
-        |. keyword "column"
-        |. spaces
-        |. symbol "="
-        |. spaces
-        |= int
-        |. spaces
-        |. symbol ","
-        |. spaces
-        |. keyword "row"
-        |. spaces
-        |. symbol "="
-        |. spaces
-        |= int
-        |. spaces
-        |. symbol "}"
+extractNodeRanges : Node Expression -> List SrcToAstMappingRanges
+extractNodeRanges node =
+    extractNodeRangesHelp [] node
 
 
-pRange : Parser Range
-pRange =
-    succeed (\end start -> Range start end)
-        |. symbol "{"
-        |. spaces
-        |. keyword "end"
-        |. spaces
-        |. symbol "="
-        |. spaces
-        |= pLoc
-        |. spaces
-        |. symbol ","
-        |. spaces
-        |. keyword "start"
-        |. spaces
-        |. symbol "="
-        |. spaces
-        |= pLoc
-        |. spaces
-        |. symbol "}"
+extractNodeRangesHelp : List SrcToAstMappingRanges -> Node Expression -> List SrcToAstMappingRanges
+extractNodeRangesHelp nodeRngs (Node astStrRng expr) =
+    case expr of
+        Application (name :: rng :: payload) ->
+            case name of
+                Node _ (FunctionOrValue [] "Node") ->
+                    let
+                        thisNodeInfo =
+                            { srcStrRange = extractSrcRange rng
+                            , astStrRange = astStrRng
+                            }
+
+                        payloadNodeInfos =
+                            List.map (extractNodeRangesHelp []) payload
+                                |> List.concat
+                    in
+                    (thisNodeInfo :: nodeRngs) ++ payloadNodeInfos
+
+                _ ->
+                    List.map (extractNodeRangesHelp []) (rng :: payload)
+                        |> List.concat
+                        |> (++) nodeRngs
+
+        ParenthesizedExpression nodeExpr ->
+            extractNodeRangesHelp nodeRngs nodeExpr
+
+        RecordExpr recSetters ->
+            recSetters
+                |> List.map Node.value
+                |> List.map Tuple.second
+                |> List.map (extractNodeRangesHelp [])
+                |> List.concat
+                |> (++) nodeRngs
+
+        ListExpr exprs ->
+            exprs
+                |> List.map (extractNodeRangesHelp [])
+                |> List.concat
+                |> (++) nodeRngs
+
+        _ ->
+            []
 
 
-{-| A Node type contains a Range and a value that can contain more nodes hence
-it's described here as a node tree. All nested Nodes are surfaced up to their
-parent to be combined into a flat list.
--}
-pNodeTree : Parser (List AstNodeInfo)
-pNodeTree =
-    succeed
-        (\aso sr nn aeo -> AstNodeInfo aso sr aeo :: nn)
-        |= getOffset
-        |. keyword "Node"
-        |. spaces
-        |= pRange
-        |. spaces
-        |= pNodeValue
-        |= getOffset
+extractSrcRange : Node Expression -> Range
+extractSrcRange recordAst =
+    case recordAst of
+        Node _ (RecordExpr (e1 :: e2 :: _)) ->
+            let
+                ( locType1, loc1 ) =
+                    extractLoc e1
+
+                ( _, loc2 ) =
+                    extractLoc e2
+            in
+            case locType1 of
+                "start" ->
+                    { start = loc1, end = loc2 }
+
+                _ ->
+                    { start = loc2, end = loc1 }
+
+        _ ->
+            Range.empty
 
 
-{-| There are 4 types of Node values:
+extractLoc : Node ( Node String, Node Expression ) -> ( String, Location )
+extractLoc (Node _ ( Node _ key, Node _ expr )) =
+    case expr of
+        RecordExpr (e1 :: e2 :: _) ->
+            let
+                ( rowOrColType1, rowOrColVal1 ) =
+                    extractRowOrCol e1
 
-1.  a simple quoted string
-2.  a tuple or a value wrapped in parentheses
-3.  a list inside square brackets
-4.  a record inside curly braces
+                ( _, rowOrColVal2 ) =
+                    extractRowOrCol e2
+            in
+            case rowOrColType1 of
+                "row" ->
+                    ( key, { row = rowOrColVal1, column = rowOrColVal2 } )
 
-For cases 2, 3 and 4 there may be nested Nodes within.
+                _ ->
+                    ( key, { row = rowOrColVal2, column = rowOrColVal1 } )
 
--}
-pNodeValue : Parser (List AstNodeInfo)
-pNodeValue =
-    oneOf
-        [ pQuotedString
-        , pContainer
-        ]
-
-
-pQuotedString : Parser (List AstNodeInfo)
-pQuotedString =
-    succeed []
-        |. symbol "\""
-        |. chompWhile (\c -> c /= '"')
-        |. symbol "\""
+        _ ->
+            ( "", { row = 0, column = 0 } )
 
 
-pContainer : Parser (List AstNodeInfo)
-pContainer =
-    oneOf
-        [ pNodeTreesBetween "[" "]"
-        , pNodeTreesBetween "{" "}"
-        , pNodeTreesBetween "(" ")"
-        ]
+extractRowOrCol rowOrCol =
+    case rowOrCol of
+        Node _ ( Node _ locType, Node _ (Integer int) ) ->
+            ( locType, int )
 
-
-pNodeTreesBetween : String -> String -> Parser (List AstNodeInfo)
-pNodeTreesBetween preStr postStr =
-    succeed identity
-        |. symbol preStr
-        |= pNodeTrees
-        |. symbol postStr
-
-
-{-| Skip over characters inbetween Nodes.
-
-Special considerations:
-
-    1. The keyword parser used within pNodeTree can be triggered within any
-       sequence of alpha chars that have "Node" at the end because once the
-       parser has chomped up to the "N", the keyword parser would then succeed
-       so long as there is whitespace after the e. To avoid this situation,
-       always skip to the end of any sequence of alpha chars.
-
-    2. The AST custom type "Node" may by chance exist as a custom type in the
-       original source code and will mistaken as an actual AST Node. To work
-       around this, just skip past all quoted strings because custom types in
-       the source will be quoted in the AST.
-
-    3. Never skip over opening or closing chars for tuples, records or lists.
-       They will be handled by pNodeTreesBetween.
-
--}
-pSkip : Parser (List AstNodeInfo)
-pSkip =
-    succeed []
-        |. chompWhile Char.isAlpha
-        |. oneOf
-            [ pQuotedString |> map (\_ -> ())
-            , chompIf (\c -> not (List.member c [ '[', ']', '{', '}', '(', ')' ]))
-            ]
-
-
-{-| Parse NodeTrees at the same level of nesting.
--}
-pNodeTrees : Parser (List AstNodeInfo)
-pNodeTrees =
-    loop [] pNodeTreesHelp
-
-
-pNodeTreesHelp : List AstNodeInfo -> Parser (Step (List AstNodeInfo) (List AstNodeInfo))
-pNodeTreesHelp nodeTrees =
-    oneOf
-        [ succeed (\nodeTree -> Loop (List.append nodeTrees nodeTree))
-            |= pNodeTree
-        , succeed (\_ -> Loop nodeTrees)
-            |= pSkip
-        , succeed (\newNodeTrees -> Loop (List.append nodeTrees newNodeTrees))
-            |= pContainer
-        , succeed ()
-            |> map (\_ -> Done (List.reverse nodeTrees))
-        ]
+        _ ->
+            ( "", 0 )
 
 
 
@@ -210,14 +209,23 @@ pNodeTreesHelp nodeTrees =
 --
 
 
-createMapping : String -> AstNodeInfo -> SrcToAstMapping
-createMapping srcString (AstNodeInfo astStart srcRange astEnd) =
+createMapping : String -> String -> SrcToAstMappingRanges -> SrcToAstMapping
+createMapping srcString astString { srcStrRange, astStrRange } =
     let
         srcStart =
-            locToOffset srcRange.start srcString
+            locToOffset srcStrRange.start srcString
 
         srcEnd =
-            locToOffset srcRange.end srcString
+            locToOffset srcStrRange.end srcString
+
+        astStart =
+            locToOffset astStrRange.start astString - 40
+
+        astEnd =
+            locToOffset astStrRange.end astString - 40
+
+        dbg =
+            Debug.log "astString length" (String.length astString)
     in
     { srcStringOffsetStart = srcStart
     , srcStringOffsetEnd = srcEnd

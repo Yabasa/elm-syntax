@@ -344,5 +344,5 @@ prettifyAst elmCode =
         |> List.reverse
         |> List.take (nLines - 4)
         |> List.reverse
-        |> List.map (\l -> String.reverse l |> String.slice 0 -4 |> String.reverse)
+        |> List.map (\l -> String.reverse l |> String.slice 0 -3 |> String.reverse)
         |> String.join "\n"
